@@ -22,6 +22,31 @@ const SCHEDULER_TYPE_LABELS: Record<number, string> = {
   3: "interval",
 };
 
+/**
+ * The `CronJob` surface this service wraps. `fireOnTick` is what the cron
+ * library calls on every trigger, so wrapping it covers every callback
+ * registered on that job.
+ */
+interface CronJobLike {
+  fireOnTick?: (...args: unknown[]) => unknown;
+}
+
+/**
+ * The `SchedulerRegistry` surface this service patches. Only `addCronJob` is
+ * instrumentable: `addInterval` and `addTimeout` receive an already-scheduled
+ * handle rather than a callback, so by the time the registry sees them the
+ * function is beyond reach.
+ */
+interface SchedulerRegistryLike {
+  prototype?: {
+    addCronJob?: (
+      name: string,
+      job: CronJobLike,
+      ...rest: unknown[]
+    ) => unknown;
+  };
+}
+
 /** The `ScheduleExplorer` surface this service patches, structurally typed. */
 interface ScheduleExplorerLike {
   prototype?: {
@@ -45,11 +70,20 @@ type WrapFunction = (
  * prototype from the constructor, before the explorer's own `onModuleInit`
  * runs discovery. The explorer's wrapper is kept and ours goes inside it, so
  * a throwing handler is still logged as before, just also reported.
+ *
+ * That seam only covers handlers the explorer *discovers* - the decorator
+ * forms. Jobs registered at runtime with
+ * `schedulerRegistry.addCronJob(name, new CronJob(...))` never reach the
+ * explorer, so they need a second seam: `SchedulerRegistry.addCronJob`, where
+ * the job object is still in hand and its `fireOnTick` can be wrapped.
+ * Without it those jobs run with no active span and their database work is
+ * reported as orphan root spans, with nothing naming the job that caused it.
  */
 @Injectable()
 export class ScheduleObserveAgentService {
   constructor() {
     this.patchScheduleExplorer();
+    this.patchSchedulerRegistry();
   }
 
   /**
@@ -147,6 +181,112 @@ export class ScheduleObserveAgentService {
         "schedule",
       name: explicitName || `${className}.${methodName}`,
     };
+  }
+
+  /**
+   * Loads `SchedulerRegistry` from the package entry point. Unlike
+   * `ScheduleExplorer` this is public API, so the entry point always has it
+   * when the package is installed.
+   */
+  private loadSchedulerRegistry(): SchedulerRegistryLike | undefined {
+    type RegistryModule = { SchedulerRegistry?: SchedulerRegistryLike };
+    const entryPoint = loadOptionalPeer<RegistryModule>("@nestjs/schedule");
+    if (!entryPoint.installed) {
+      return undefined;
+    }
+    if (entryPoint.module?.SchedulerRegistry) {
+      return entryPoint.module.SchedulerRegistry;
+    }
+    console.warn(
+      `@nestjs/schedule is installed but its SchedulerRegistry could not be loaded, so dynamically registered cron jobs will not be instrumented: ${describePeerLoadError(
+        entryPoint.error ??
+          new Error("SchedulerRegistry is not exported by @nestjs/schedule"),
+      )}`,
+    );
+    return undefined;
+  }
+
+  private patchSchedulerRegistry(): void {
+    const SchedulerRegistry = this.loadSchedulerRegistry();
+    const prototype = SchedulerRegistry?.prototype;
+    const original = prototype?.addCronJob;
+    if (!prototype || typeof original !== "function") {
+      return;
+    }
+
+    const PATCHED = Symbol.for("@crudmates/observe:scheduler-registry-patched");
+    const marked = original as typeof original & { [PATCHED]?: true };
+    if (marked[PATCHED]) {
+      return;
+    }
+
+    const instrument = (name: string, job: CronJobLike) =>
+      this.instrumentCronJob(name, job);
+
+    const patched = function (
+      this: unknown,
+      name: string,
+      job: CronJobLike,
+      ...rest: unknown[]
+    ) {
+      try {
+        instrument(name, job);
+      } catch {
+        // Never let instrumentation stop a job from being registered.
+      }
+      return original.call(this, name, job, ...rest);
+    } as NonNullable<typeof original> & { [PATCHED]?: true };
+    patched[PATCHED] = true;
+    prototype.addCronJob = patched;
+  }
+
+  /**
+   * Wraps one job's `fireOnTick` so each trigger runs inside a span the job's
+   * own work is parented to. Marked on the instance so re-registering the same
+   * job object cannot nest the span twice.
+   */
+  private instrumentCronJob(name: string, job: CronJobLike): void {
+    const originalFire = job?.fireOnTick;
+    if (typeof originalFire !== "function") {
+      return;
+    }
+    const JOB_PATCHED = Symbol.for("@crudmates/observe:cron-job-patched");
+    const marked = job as CronJobLike & { [JOB_PATCHED]?: true };
+    if (marked[JOB_PATCHED]) {
+      return;
+    }
+
+    const run = (...args: unknown[]) =>
+      this.runInSpan(`cron ${name}`, () => originalFire.apply(job, args));
+    job.fireOnTick = run;
+    Object.defineProperty(job, JOB_PATCHED, {
+      value: true,
+      enumerable: false,
+    });
+  }
+
+  /**
+   * Runs `work` inside an active span, awaiting a promise result so the span
+   * covers the whole job rather than just its synchronous prologue.
+   */
+  private runInSpan<T>(spanName: string, work: () => T | Promise<T>) {
+    return trace
+      .getTracer("@crudmates/observe")
+      .startActiveSpan(
+        spanName,
+        { kind: SpanKind.INTERNAL },
+        async (span: Span) => {
+          try {
+            return await work();
+          } catch (err) {
+            span.recordException(err as Error);
+            span.setStatus({ code: SpanStatusCode.ERROR });
+            throw err;
+          } finally {
+            span.end();
+          }
+        },
+      );
   }
 
   private instrumentHandler(

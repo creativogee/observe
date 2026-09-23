@@ -1,0 +1,54 @@
+# Collector on a single VPS you control over SSH, alongside the app.
+#
+# For Coolify or another PaaS that owns the compose file, use
+# coolify-compose.yaml in this directory instead - a platform-managed compose
+# has no adjacent file, so the env_file below cannot work there.
+#
+#   docker compose -f deploy/vps/docker-compose.yaml up -d
+#
+# Reuses the Grafana Cloud collector config one directory over, so there is
+# one copy of the pipeline rather than a VPS-specific fork of it.
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.159.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    restart: unless-stopped
+
+    # Bound to loopback on purpose. The app → collector hop is deliberately
+    # unauthenticated, so anything that can reach these ports can inject spans
+    # into your Grafana Cloud account and burn the quota. On a single VPS the
+    # app reaches it at http://localhost:4318 and nothing else needs to.
+    #
+    # If the app runs on a different host, do NOT simply drop the 127.0.0.1
+    # prefix - put the collector behind a private network or firewall the
+    # ports to that host's address.
+    ports:
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+
+    volumes:
+      - ../grafana-cloud/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+
+    # Credentials live in a file the collector reads, not in this compose file,
+    # so the repo never carries them. See README.md in this directory.
+    env_file:
+      - ./grafana-cloud.env
+
+    # `memory_limiter` in the config sheds load at 512 MiB; the container needs
+    # headroom above that or the kernel OOM-kills before the limiter engages.
+    mem_limit: 768m
+
+    # Without this a long-running collector's logs grow without bound and
+    # eventually fill the VPS disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "--version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

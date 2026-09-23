@@ -1,0 +1,131 @@
+# Collector for Coolify (or any PaaS that owns the compose file).
+#
+# Differs from docker-compose.yaml in this directory, which is for plain Docker
+# over SSH. Use exactly one of them:
+#
+#   docker-compose.yaml   you control the filesystem: config is a bind mount,
+#                         credentials come from an adjacent env_file
+#   coolify-compose.yaml  the platform owns the compose content: there is no
+#                         adjacent file, so config and credentials are inlined
+#
+# Two things force the inlining. Coolify makes volume mounts read-only for
+# compose services, so the config cannot be a file. And a compose `environment:`
+# entry naming a variable without a value is treated as compose-managed, which
+# locks its value in the UI - so the values live here rather than in Coolify's
+# environment tab.
+#
+# Values are literal rather than ${env:...} because docker compose would try to
+# interpolate those before the collector ever sees them.
+#
+# No ports are published: the app reaches this over the platform's internal
+# network, and the app -> collector hop is unauthenticated by design, so it must
+# never be reachable from the internet.
+#
+# Replace REPLACE_WITH_INSTANCE_ID, REPLACE_WITH_API_TOKEN and the REGION in the
+# endpoint with the values from Grafana Cloud -> Connections -> OTLP.
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.159.0
+    command: ["--config=env:OTELCOL_CONFIG"]
+    restart: unless-stopped
+    mem_limit: 768m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      OTELCOL_CONFIG: |
+        extensions:
+          # Grafana Cloud authenticates OTLP with HTTP basic auth: the stack's numeric
+          # instance ID as username, an API token as password.
+          basicauth/grafana_cloud:
+            client_auth:
+              username: "REPLACE_WITH_INSTANCE_ID"
+              password: "REPLACE_WITH_API_TOKEN"
+
+        receivers:
+          otlp:
+            protocols:
+              grpc:
+                endpoint: 0.0.0.0:4317
+              http:
+                endpoint: 0.0.0.0:4318
+
+        processors:
+          memory_limiter:
+            check_interval: 1s
+            limit_mib: 512
+            spike_limit_mib: 128
+
+          # Free tier allows 10k active metric series. `span_metrics` below multiplies
+          # series by service x span name x route x method x status, which across 25
+          # services reaches that ceiling quickly. Trim `dimensions` before raising
+          # the plan - the overage is on the one quota that is not generous.
+          tail_sampling:
+            decision_wait: 10s
+            num_traces: 50000
+            expected_new_traces_per_sec: 100
+            policies:
+              - name: errors-always
+                type: status_code
+                status_code:
+                  status_codes: [ERROR]
+              - name: latency-over-500ms
+                type: latency
+                latency:
+                  threshold_ms: 500
+              - name: baseline
+                type: probabilistic
+                probabilistic:
+                  sampling_percentage: 10
+
+          batch:
+            timeout: 5s
+            send_batch_size: 1024
+
+        connectors:
+          span_metrics:
+            dimensions:
+              - name: http.route
+              - name: http.request.method
+              - name: rpc.system
+              - name: rpc.service
+              - name: rpc.method
+
+        exporters:
+          # One endpoint for all three signals. `otlphttp` appends `/v1/traces`,
+          # `/v1/metrics` and `/v1/logs` to the configured base URL, so unlike the
+          # self-hosted recipe there is no separate Tempo / Mimir / Loki exporter and
+          # no `prometheusremotewrite` - Grafana Cloud's gateway fans out on its side.
+          otlp_http/grafana_cloud:
+            endpoint: "https://otlp-gateway-prod-REGION.grafana.net/otlp"
+            auth:
+              authenticator: basicauth/grafana_cloud
+
+        service:
+          extensions: [basicauth/grafana_cloud]
+          pipelines:
+            # Fan-out at the receiver so span_metrics sees every span. Downstream of
+            # tail sampling it would follow the keep rate, biasing error rate toward
+            # 100% - the kept population is mostly errors and slow traces by design.
+            traces/metrics:
+              receivers: [otlp]
+              processors: [memory_limiter, batch]
+              exporters: [span_metrics]
+
+            traces/cloud:
+              receivers: [otlp]
+              processors: [memory_limiter, tail_sampling, batch]
+              exporters: [otlp_http/grafana_cloud]
+
+            metrics:
+              receivers: [otlp, span_metrics]
+              processors: [memory_limiter, batch]
+              exporters: [otlp_http/grafana_cloud]
+
+            logs:
+              receivers: [otlp]
+              processors: [memory_limiter, batch]
+              exporters: [otlp_http/grafana_cloud]

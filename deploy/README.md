@@ -7,6 +7,9 @@
 | [`local/`](./local/) | Tempo + Mimir + Loki + Grafana, in Compose | 5 containers on one host | Development. Throwaway data, no account needed |
 | [`grafana-cloud/`](./grafana-cloud/) | Managed by Grafana | 1–2 collectors | **Current direction.** Free tier for testing, same configs in cluster |
 | [`self-hosted/`](./self-hosted/) | Tempo + Mimir + Loki in your cluster | 6 Helm releases | Full control, data never leaves the cluster |
+| [`vps/`](./vps/) | Grafana Cloud (managed) | 1 container on your box | A single VPS, no Kubernetes |
+
+`vps/` is `grafana-cloud/` plus the process supervision a single box needs; it reuses that config rather than forking it.
 
 These are alternatives, not stages. Nothing in `local/` has to be torn down to try `grafana-cloud/`, and nothing in either forecloses `self-hosted/` later.
 

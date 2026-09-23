@@ -86,16 +86,16 @@ With no sampler configured the default is `ParentBased(AlwaysOn)`: send everythi
 
 Automatic, when the relevant package is installed:
 
-| Area      | Covered                                                                                |
-| --------- | -------------------------------------------------------------------------------------- |
-| HTTP      | Inbound server spans with route templates; outbound via `http` and `undici`/`fetch`    |
-| gRPC      | Server spans from metadata; **client propagation through Nest's `ClientProxyFactory`** |
-| Pub/Sub   | `@google-cloud/pubsub` publish injection and consumer extraction                       |
-| Queues    | BullMQ processors, with wait time, attempts and max attempts                           |
-| Schedule  | `@nestjs/schedule` cron and interval jobs                                              |
-| Databases | `pg`, `ioredis`, `redis`                                                               |
-| Runtime   | Event-loop delay, heap, RSS, GC                                                        |
-| Providers | Per-method spans via the Nest instrument decorator                                     |
+| Area      | Covered                                                                                   |
+| --------- | ----------------------------------------------------------------------------------------- |
+| HTTP      | Inbound server spans with route templates; outbound via `http` and `undici`/`fetch`       |
+| gRPC      | Server spans from metadata; **client propagation through Nest's `ClientProxyFactory`**    |
+| Pub/Sub   | `@google-cloud/pubsub` publish injection and consumer extraction                          |
+| Queues    | BullMQ processors, with wait time, attempts and max attempts                              |
+| Schedule  | `@nestjs/schedule` cron and interval jobs, via `@Cron`/`@Interval` or `SchedulerRegistry` |
+| Databases | `pg`, `ioredis`, `redis`                                                                  |
+| Runtime   | Event-loop delay, heap, RSS, GC                                                           |
+| Providers | Per-method spans via the Nest instrument decorator                                        |
 
 ## Logs
 

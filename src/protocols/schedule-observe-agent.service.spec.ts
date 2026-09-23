@@ -1,4 +1,4 @@
-import "reflect-metadata";
+import { MODULE_METADATA } from "@nestjs/common/constants.js";
 import {
   context,
   propagation,
@@ -13,7 +13,7 @@ import {
   InMemorySpanExporter,
   SimpleSpanProcessor,
 } from "@opentelemetry/sdk-trace-base";
-import { MODULE_METADATA } from "@nestjs/common/constants.js";
+import "reflect-metadata";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createObserveModule } from "../observe.module.js";
 import { resetSdkForTests } from "../sdk/start-sdk.js";
@@ -64,6 +64,46 @@ function mockScheduleInstalled(ScheduleExplorer: ScheduleExplorerLike): void {
     }
     return { installed: true, module: { ScheduleExplorer } };
   });
+}
+
+type CronJobLike = { fireOnTick?: (...args: unknown[]) => unknown };
+type SchedulerRegistryLike = {
+  prototype: {
+    addCronJob?: (
+      name: string,
+      job: CronJobLike,
+      ...rest: unknown[]
+    ) => unknown;
+  };
+};
+
+/** Mirrors `cron`'s CronJob: `fireOnTick` is what runs on every trigger. */
+function createFakeCronJob(work: () => unknown): CronJobLike {
+  return {
+    fireOnTick() {
+      return work();
+    },
+  };
+}
+
+function createFakeSchedulerRegistry(): SchedulerRegistryLike {
+  class FakeSchedulerRegistry {
+    static registered: Array<{ name: string; job: CronJobLike }> = [];
+    addCronJob(name: string, job: CronJobLike) {
+      FakeSchedulerRegistry.registered.push({ name, job });
+    }
+  }
+  return FakeSchedulerRegistry;
+}
+
+function mockScheduleWithRegistry(
+  ScheduleExplorer: ScheduleExplorerLike,
+  SchedulerRegistry: SchedulerRegistryLike,
+): void {
+  vi.mocked(loadOptionalPeer).mockImplementation(() => ({
+    installed: true,
+    module: { ScheduleExplorer, SchedulerRegistry },
+  }));
 }
 
 describe("ScheduleObserveAgentService", () => {
@@ -180,5 +220,147 @@ describe("ObserveModule schedule agent registration", () => {
     const providers: unknown[] =
       Reflect.getMetadata(MODULE_METADATA.PROVIDERS, ObserveModule) ?? [];
     expect(providers).toContain(ScheduleObserveAgentService);
+  });
+});
+
+describe("ScheduleObserveAgentService dynamic cron registration", () => {
+  let exporter: InMemorySpanExporter;
+  let provider: BasicTracerProvider;
+
+  beforeEach(() => {
+    vi.mocked(loadOptionalPeer).mockReset();
+    context.disable();
+    exporter = new InMemorySpanExporter();
+    provider = new BasicTracerProvider({
+      spanProcessors: [new SimpleSpanProcessor(exporter)],
+    });
+    trace.setGlobalTracerProvider(provider);
+    const manager = new AsyncLocalStorageContextManager();
+    manager.enable();
+    context.setGlobalContextManager(manager);
+    propagation.setGlobalPropagator(new W3CTraceContextPropagator());
+  });
+
+  afterEach(async () => {
+    context.disable();
+    trace.disable();
+    propagation.disable();
+    await provider.shutdown();
+  });
+
+  it("wraps a job registered through SchedulerRegistry.addCronJob", async () => {
+    const ScheduleExplorer = createFakeScheduleExplorer();
+    const SchedulerRegistry = createFakeSchedulerRegistry();
+    mockScheduleWithRegistry(ScheduleExplorer, SchedulerRegistry);
+    new ScheduleObserveAgentService();
+
+    const registry = new (
+      SchedulerRegistry as unknown as new () => {
+        addCronJob: (n: string, j: CronJobLike) => void;
+      }
+    )();
+    const job = createFakeCronJob(() => "done");
+    registry.addCronJob("outbox-drain", job);
+
+    await job.fireOnTick!();
+
+    const span = exporter.getFinishedSpans().at(-1);
+    // The whole point: the job's own work now has a named parent instead of
+    // reporting orphan database spans.
+    expect(span?.name).toBe("cron outbox-drain");
+  });
+
+  it("parents the job's own spans under the job span", async () => {
+    const ScheduleExplorer = createFakeScheduleExplorer();
+    const SchedulerRegistry = createFakeSchedulerRegistry();
+    mockScheduleWithRegistry(ScheduleExplorer, SchedulerRegistry);
+    new ScheduleObserveAgentService();
+
+    const registry = new (
+      SchedulerRegistry as unknown as new () => {
+        addCronJob: (n: string, j: CronJobLike) => void;
+      }
+    )();
+    const job = createFakeCronJob(() => {
+      trace.getTracer("test").startActiveSpan("pg.query", (child) => {
+        child.end();
+      });
+    });
+    registry.addCronJob("outbox-drain", job);
+
+    await job.fireOnTick!();
+
+    const spans = exporter.getFinishedSpans();
+    const child = spans.find((s) => s.name === "pg.query");
+    const parent = spans.find((s) => s.name === "cron outbox-drain");
+    expect(child?.parentSpanContext?.spanId).toBe(parent?.spanContext().spanId);
+  });
+
+  it("marks the job span ERROR when the job throws", async () => {
+    const ScheduleExplorer = createFakeScheduleExplorer();
+    const SchedulerRegistry = createFakeSchedulerRegistry();
+    mockScheduleWithRegistry(ScheduleExplorer, SchedulerRegistry);
+    new ScheduleObserveAgentService();
+
+    const registry = new (
+      SchedulerRegistry as unknown as new () => {
+        addCronJob: (n: string, j: CronJobLike) => void;
+      }
+    )();
+    const job = createFakeCronJob(() => {
+      throw new Error("drain failed");
+    });
+    registry.addCronJob("outbox-drain", job);
+
+    await expect(job.fireOnTick!()).rejects.toThrow("drain failed");
+    expect(exporter.getFinishedSpans().at(-1)?.status.code).toBe(
+      SpanStatusCode.ERROR,
+    );
+  });
+
+  it("still registers the job with the real registry", async () => {
+    const ScheduleExplorer = createFakeScheduleExplorer();
+    const SchedulerRegistry = createFakeSchedulerRegistry();
+    mockScheduleWithRegistry(ScheduleExplorer, SchedulerRegistry);
+    new ScheduleObserveAgentService();
+
+    const registered = (
+      SchedulerRegistry as unknown as { registered: unknown[] }
+    ).registered;
+    registered.length = 0;
+    const registry = new (
+      SchedulerRegistry as unknown as new () => {
+        addCronJob: (n: string, j: CronJobLike) => void;
+      }
+    )();
+    registry.addCronJob(
+      "outbox-drain",
+      createFakeCronJob(() => undefined),
+    );
+
+    // Instrumentation must never swallow the registration itself.
+    expect(registered).toHaveLength(1);
+  });
+
+  it("does not double-wrap a job registered twice", async () => {
+    const ScheduleExplorer = createFakeScheduleExplorer();
+    const SchedulerRegistry = createFakeSchedulerRegistry();
+    mockScheduleWithRegistry(ScheduleExplorer, SchedulerRegistry);
+    new ScheduleObserveAgentService();
+
+    const registry = new (
+      SchedulerRegistry as unknown as new () => {
+        addCronJob: (n: string, j: CronJobLike) => void;
+      }
+    )();
+    const job = createFakeCronJob(() => undefined);
+    registry.addCronJob("outbox-drain", job);
+    registry.addCronJob("outbox-drain", job);
+
+    await job.fireOnTick!();
+
+    expect(
+      exporter.getFinishedSpans().filter((s) => s.name === "cron outbox-drain"),
+    ).toHaveLength(1);
   });
 });

@@ -1,3 +1,6 @@
 node_modules
 dist
 *.rdb
+
+# Collector credentials for a VPS deployment. Only the .example is tracked.
+deploy/vps/grafana-cloud.env
