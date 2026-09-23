@@ -1,0 +1,117 @@
+# Crudmates Observe — production collector, TIER 1 (gateway).
+#
+# Stateless. Scale to as many replicas as ingest needs. This is the only
+# collector address the 25 Nest services know (`OBSERVE_ENDPOINT`).
+#
+# Everything that does NOT need a whole trace in one process lives here:
+# span_metrics RED, app metrics, and logs. Traces destined for Tempo are
+# forwarded to TIER 2 (`otel-collector-sampler.yaml`) through the
+# `loadbalancing` exporter, which pins every span of a trace to one tier-2
+# instance so `tail_sampling` there sees the complete trace.
+#
+# Local development does NOT use this file - `deploy/local/otel-collector.yaml`
+# is the single-process recipe for Compose.
+#
+# Validate:
+#   docker run --rm \
+#     -v "$(pwd)/deploy/self-hosted/otel-collector-gateway.yaml:/etc/otelcol/config.yaml:ro" \
+#     otel/opentelemetry-collector-contrib:latest \
+#     validate --config=/etc/otelcol/config.yaml
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+connectors:
+  span_metrics:
+    dimensions:
+      - name: http.route
+      - name: http.request.method
+      - name: rpc.system
+      - name: rpc.service
+      - name: rpc.method
+
+exporters:
+  # Trace-ID-aware routing to tier 2. Without this, N sampler replicas behind a
+  # round-robin Service each receive a fragment of every trace, and
+  # `tail_sampling` judges each fragment on partial information: the replica
+  # holding an ERROR span keeps its fragment while the replicas holding the
+  # rest of that same trace drop theirs. The "keep all errors" policy would
+  # then fail precisely on the traces it exists to preserve.
+  loadbalancing:
+    routing_key: traceID
+    protocol:
+      otlp:
+        tls:
+          insecure: true
+    resolver:
+      # Headless Service: DNS returns every sampler pod IP rather than one
+      # ClusterIP, which is what lets this exporter address instances
+      # individually. A ClusterIP Service here silently degrades to
+      # round-robin and reintroduces the split-trace bug.
+      #
+      # On Kubernetes the `k8s` resolver reacts to pod churn faster than DNS
+      # TTL allows; swap it in if ops runs the collector with RBAC to watch
+      # endpoints:
+      #   k8s:
+      #     service: otel-collector-sampler.observability
+      dns:
+        hostname: "${env:SAMPLER_DNS:-otel-collector-sampler-headless.observability.svc.cluster.local}"
+        port: "4317"
+        interval: 30s
+
+  prometheusremotewrite:
+    endpoint: "${env:MIMIR_REMOTE_WRITE}"
+    # Tier 1 runs N replicas, and each one emits span_metrics series for the
+    # same (service.name, span.name, ...) tuples. Identical series arriving
+    # from several senders are rejected by Mimir as duplicate/out-of-order
+    # samples, so each replica's series must be distinguishable. Dashboards
+    # must therefore aggregate across it - `sum by (service_name, span_name)`,
+    # never a bare series selector.
+    external_labels:
+      collector_instance: "${env:POD_NAME}"
+
+  otlp_http/loki:
+    endpoint: "${env:LOKI_ENDPOINT}"
+
+service:
+  pipelines:
+    # Fan-out at the receiver so span_metrics sees every span. Placing
+    # span_metrics downstream of tail sampling would make RED follow the keep
+    # rate, biasing error rate toward 100% - the kept population is mostly
+    # errors and slow traces by construction.
+    traces/metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [span_metrics]
+
+    # No `batch` before `loadbalancing`: the exporter splits every incoming
+    # batch by trace ID anyway, so batching first is work that is immediately
+    # undone. Tier 2 batches after its sampling decision.
+    traces/sampling:
+      receivers: [otlp]
+      processors: [memory_limiter]
+      exporters: [loadbalancing]
+
+    metrics:
+      receivers: [otlp, span_metrics]
+      processors: [memory_limiter, batch]
+      exporters: [prometheusremotewrite]
+
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/loki]

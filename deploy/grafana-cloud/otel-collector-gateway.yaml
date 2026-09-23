@@ -1,0 +1,110 @@
+# Crudmates Observe — Grafana Cloud, TIER 1 (gateway).
+#
+# The scale-out half of `otel-collector.yaml` in this directory. Use this pair
+# once one collector replica is no longer enough; below that, the single file
+# is simpler and does the same job.
+#
+# Stateless, scales freely. The only collector address the Nest services know
+# (`OBSERVE_ENDPOINT`). Carries everything that does NOT need a whole trace in
+# one process - span_metrics, app metrics, logs - straight to Grafana Cloud,
+# and forwards traces to TIER 2 through `loadbalancing` so `tail_sampling`
+# there sees complete traces.
+#
+# Credentials: see `otel-collector.yaml` in this directory.
+
+extensions:
+  basicauth/grafana_cloud:
+    client_auth:
+      username: "${env:GRAFANA_CLOUD_INSTANCE_ID}"
+      password: "${env:GRAFANA_CLOUD_API_TOKEN}"
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+connectors:
+  span_metrics:
+    dimensions:
+      - name: http.route
+      - name: http.request.method
+      - name: rpc.system
+      - name: rpc.service
+      - name: rpc.method
+
+exporters:
+  # Trace-ID-aware routing to tier 2. Without it, N sampler replicas behind a
+  # round-robin Service each receive a fragment of every trace: the replica
+  # holding an ERROR span keeps its fragment while replicas holding the rest
+  # of that trace drop theirs, so `errors-always` fails on exactly the traces
+  # it exists to preserve.
+  loadbalancing:
+    routing_key: traceID
+    protocol:
+      otlp:
+        tls:
+          insecure: true
+    resolver:
+      # Headless Service (`clusterIP: None`). A ClusterIP Service balances per
+      # connection and silently undoes this routing.
+      dns:
+        hostname: "${env:SAMPLER_DNS:-otel-collector-sampler-headless.observability.svc.cluster.local}"
+        port: "4317"
+        interval: 30s
+
+  otlp_http/grafana_cloud:
+    endpoint: "${env:GRAFANA_CLOUD_OTLP_ENDPOINT}"
+    auth:
+      authenticator: basicauth/grafana_cloud
+    # UNRESOLVED AT N REPLICAS. Every tier-1 replica emits span_metrics series
+    # for the same (service, span name, route) tuples, and identical series
+    # arriving from several senders are rejected as duplicate samples. The
+    # self-hosted recipe fixes this with `external_labels` on
+    # `prometheusremotewrite`; `otlphttp` has no equivalent, and a header does
+    # not become a label.
+    #
+    # Two ways out, both ops decisions - see ../README.md:
+    #   1. Send metrics to Grafana Cloud's Prometheus remote-write endpoint
+    #      instead, with `external_labels: {collector_instance: ${env:POD_NAME}}`
+    #      (traces and logs stay on OTLP). Costs one extra credential pair.
+    #   2. Run span_metrics on its own collector pool routed by `service`
+    #      rather than `traceID`, so one instance owns a service's series.
+    #
+    # Single-replica tier 1 is unaffected. Verify under load before scaling.
+
+service:
+  extensions: [basicauth/grafana_cloud]
+  pipelines:
+    traces/metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [span_metrics]
+
+    # No `batch` before `loadbalancing`: the exporter splits every batch by
+    # trace ID anyway, so batching first is work immediately undone.
+    traces/sampling:
+      receivers: [otlp]
+      processors: [memory_limiter]
+      exporters: [loadbalancing]
+
+    metrics:
+      receivers: [otlp, span_metrics]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/grafana_cloud]
+
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/grafana_cloud]

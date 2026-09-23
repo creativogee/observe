@@ -1,0 +1,79 @@
+# Crudmates Observe — Grafana Cloud, TIER 2 (sampler).
+#
+# Receives traces only, and only from TIER 1's `loadbalancing` exporter, which
+# pins every span of a trace to one instance here. That pinning is what makes
+# `tail_sampling` correct: the decision needs the whole trace.
+#
+# Deploy behind a HEADLESS Service (`clusterIP: None`).
+#
+# Replicas are cheap to add but not free to remove: an instance holds traces
+# in memory for `decision_wait` before deciding, so a rolling restart drops
+# whatever is mid-decision. Trace loss on deploy is bounded by `decision_wait`.
+# Metrics and logs are unaffected - they never transit this tier.
+#
+# Credentials: see `otel-collector.yaml` in this directory.
+
+extensions:
+  basicauth/grafana_cloud:
+    client_auth:
+      username: "${env:GRAFANA_CLOUD_INSTANCE_ID}"
+      password: "${env:GRAFANA_CLOUD_API_TOKEN}"
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 2048
+    spike_limit_mib: 512
+
+  # Budget control in one place rather than in every service. The SDK ships
+  # everything (ParentBased(AlwaysOn)) precisely so this decision can be made
+  # with the full trace in hand - an app cannot know at root-span time that
+  # the request will fail three hops later.
+  #
+  # On the free tier the binding constraint is 10k active metric series, not
+  # the 50 GB of traces, so lowering `sampling_percentage` saves less than
+  # trimming tier 1's span_metrics `dimensions`.
+  tail_sampling:
+    # Must exceed p99 end-to-end trace duration. Set below it and slow traces
+    # are decided before their slowest spans arrive, which defeats the latency
+    # policy - those traces are the ones most likely still in flight.
+    decision_wait: 10s
+    num_traces: 50000
+    expected_new_traces_per_sec: 100
+    policies:
+      - name: errors-always
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: latency-over-500ms
+        type: latency
+        latency:
+          threshold_ms: 500
+      - name: baseline
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 10
+
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+exporters:
+  otlp_http/grafana_cloud:
+    endpoint: "${env:GRAFANA_CLOUD_OTLP_ENDPOINT}"
+    auth:
+      authenticator: basicauth/grafana_cloud
+
+service:
+  extensions: [basicauth/grafana_cloud]
+  pipelines:
+    traces/cloud:
+      receivers: [otlp]
+      processors: [memory_limiter, tail_sampling, batch]
+      exporters: [otlp_http/grafana_cloud]

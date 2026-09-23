@@ -1,0 +1,148 @@
+{
+  "name": "@crudmates/observe",
+  "version": "0.0.1",
+  "description": "NestJS 12 observability SDK - OpenTelemetry traces, metrics and logs over OTLP",
+  "license": "MIT",
+  "sideEffects": true,
+  "author": "Gbenga Omowole <omowole.gbenga@gmail.com>",
+  "type": "module",
+  "main": "./dist/cjs/index.js",
+  "types": "./dist/cjs/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "build": "npm run clean && npm run build:esm && npm run build:cjs && node scripts/write-dist-types.mjs",
+    "build:cjs": "tsc -p tsconfig.build.cjs.json",
+    "build:esm": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\"",
+    "lint": "eslint \"{src,test}/**/*.ts\"",
+    "prepublishOnly": "npm run build",
+    "test": "vitest run",
+    "test:int": "vitest run --config vitest.int.config.ts",
+    "verify:package": "node scripts/verify-package.mjs"
+  },
+  "peerDependencies": {
+    "@nestjs/common": "^12.0.0",
+    "@nestjs/core": "^12.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@nestjs/microservices": {
+      "optional": true
+    },
+    "@nestjs/bullmq": {
+      "optional": true
+    },
+    "@nestjs/schedule": {
+      "optional": true
+    },
+    "bullmq": {
+      "optional": true
+    },
+    "pg": {
+      "optional": true
+    },
+    "ioredis": {
+      "optional": true
+    },
+    "redis": {
+      "optional": true
+    },
+    "@grpc/grpc-js": {
+      "optional": true
+    },
+    "@google-cloud/pubsub": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@grpc/grpc-js": "^1.14.4",
+    "@grpc/proto-loader": "^0.8.1",
+    "@nestjs/common": "^12.0.1",
+    "@nestjs/core": "^12.0.1",
+    "@nestjs/microservices": "^12.0.1",
+    "@nestjs/platform-express": "^12.0.1",
+    "@nestjs/testing": "^12.0.1",
+    "@types/node": "^22.20.1",
+    "@types/supertest": "^7.2.1",
+    "eslint": "^10.10.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-prettier": "^5.5.6",
+    "globals": "^17.12.0",
+    "prettier": "^3.9.8",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "supertest": "^7.2.2",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.70.0",
+    "vitest": "^4.1.11"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/api-logs": "^0.221.0",
+    "@opentelemetry/context-async-hooks": "2.10.0",
+    "@opentelemetry/core": "2.10.0",
+    "@opentelemetry/exporter-logs-otlp-http": "^0.221.0",
+    "@opentelemetry/exporter-metrics-otlp-http": "^0.221.0",
+    "@opentelemetry/exporter-prometheus": "^0.221.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.221.0",
+    "@opentelemetry/instrumentation": "^0.221.0",
+    "@opentelemetry/instrumentation-grpc": "^0.221.0",
+    "@opentelemetry/instrumentation-http": "^0.221.0",
+    "@opentelemetry/instrumentation-ioredis": "^0.69.0",
+    "@opentelemetry/instrumentation-pg": "^0.73.0",
+    "@opentelemetry/instrumentation-redis": "^0.69.0",
+    "@opentelemetry/instrumentation-runtime-node": "^0.34.0",
+    "@opentelemetry/instrumentation-undici": "^0.31.0",
+    "@opentelemetry/resources": "2.10.0",
+    "@opentelemetry/sdk-logs": "^0.221.0",
+    "@opentelemetry/sdk-metrics": "2.10.0",
+    "@opentelemetry/sdk-node": "^0.221.0",
+    "@opentelemetry/sdk-trace-base": "2.10.0",
+    "@opentelemetry/semantic-conventions": "^1.43.0"
+  },
+  "module": "./dist/esm/index.js",
+  "keywords": [
+    "nestjs",
+    "opentelemetry",
+    "observability",
+    "tracing",
+    "otlp",
+    "metrics",
+    "logs",
+    "distributed-tracing",
+    "grpc",
+    "prometheus"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/creativogee/observe.git"
+  },
+  "bugs": {
+    "url": "https://github.com/creativogee/observe/issues"
+  },
+  "homepage": "https://github.com/creativogee/observe#readme"
+}

@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.19"
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run lint
+
+      - run: npm run format:check
+
+      - run: npm run build
+
+      # Guards the dual CJS/ESM output: most NestJS services are
+      # "type": "commonjs", so a broken `require` path would surface at a
+      # consumer's first boot and nowhere earlier.
+      - run: npm run verify:package
+
+      - run: npm test
+
+      - run: npm run test:int
+
+      # Every collector config in deploy/, across all three deployment
+      # targets. These are the deployable contract handed to ops, so a config
+      # that no longer parses has to fail here rather than at a rollout.
+      # Discovered rather than listed, so a new target directory is covered
+      # without touching this workflow.
+      - name: Validate OTel collector configs
+        env:
+          # Placeholders. `validate` parses the config; it never connects.
+          TEMPO_ENDPOINT: tempo:4317
+          MIMIR_REMOTE_WRITE: http://mimir:9009/api/v1/push
+          LOKI_ENDPOINT: http://loki:3100/otlp
+          SAMPLER_DNS: otel-collector-sampler-headless.observability.svc.cluster.local
+          POD_NAME: ci
+          GRAFANA_CLOUD_OTLP_ENDPOINT: https://otlp-gateway-prod-us-east-0.grafana.net/otlp
+          GRAFANA_CLOUD_INSTANCE_ID: "000000"
+          GRAFANA_CLOUD_API_TOKEN: placeholder
+        run: |
+          set -euo pipefail
+          configs=$(find deploy -name 'otel-collector*.yaml' | sort)
+          if [ -z "$configs" ]; then
+            echo "no collector configs found under deploy/ - check the layout" >&2
+            exit 1
+          fi
+          for config in $configs; do
+            echo "validating $config"
+            if command -v otelcol >/dev/null 2>&1; then
+              otelcol validate --config="$config"
+            else
+              docker run --rm \
+                -e TEMPO_ENDPOINT -e MIMIR_REMOTE_WRITE -e LOKI_ENDPOINT \
+                -e SAMPLER_DNS -e POD_NAME \
+                -e GRAFANA_CLOUD_OTLP_ENDPOINT -e GRAFANA_CLOUD_INSTANCE_ID \
+                -e GRAFANA_CLOUD_API_TOKEN \
+                -v "$PWD/$config:/etc/otelcol/config.yaml:ro" \
+                otel/opentelemetry-collector-contrib:latest \
+                validate --config=/etc/otelcol/config.yaml
+            fi
+          done

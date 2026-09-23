@@ -1,0 +1,31 @@
+# Local Tempo 2.x (filesystem, monolithic). Pin grafana/tempo:2.8.2 —
+# grafana/tempo:latest is 3.x and Grafana time-range search misses live traces.
+server:
+  http_listen_port: 3200
+  log_level: info
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+ingester:
+  trace_idle_period: 1s
+  max_block_duration: 5s
+
+compactor:
+  compaction:
+    block_retention: 1h
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+usage_report:
+  reporting_enabled: false

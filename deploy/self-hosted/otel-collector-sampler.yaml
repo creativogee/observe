@@ -1,0 +1,82 @@
+# Crudmates Observe — production collector, TIER 2 (sampler).
+#
+# Receives only traces, only from TIER 1's `loadbalancing` exporter, which
+# pins every span of a given trace to one instance here. That pinning is the
+# precondition for `tail_sampling`: the decision needs the whole trace, and a
+# trace split across replicas is judged on fragments.
+#
+# Deploy behind a HEADLESS Service. A ClusterIP Service load-balances per
+# connection and undoes tier 1's routing.
+#
+# Replicas are cheap to add but not free to remove: an instance holds up to
+# `num_traces` traces in memory for `decision_wait` before deciding, so a
+# rolling restart drops whatever is mid-decision. Trace loss on deploy is
+# bounded by `decision_wait`, not by request duration.
+#
+# Sizing: memory scales with num_traces x avg spans/trace x span size, and
+# `memory_limiter` sheds load rather than OOM-killing the pod. Raise the
+# limit together with `num_traces`, never one alone.
+#
+# Validate:
+#   docker run --rm \
+#     -v "$(pwd)/deploy/self-hosted/otel-collector-sampler.yaml:/etc/otelcol/config.yaml:ro" \
+#     otel/opentelemetry-collector-contrib:latest \
+#     validate --config=/etc/otelcol/config.yaml
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 2048
+    spike_limit_mib: 512
+
+  # Budget control for Tempo storage, in one place rather than per service.
+  # The SDK deliberately ships everything (ParentBased(AlwaysOn)) so this
+  # decision can be made with the full trace in hand - an app cannot know at
+  # root-span time that the request will fail three hops later.
+  #
+  # Policies are OR'd: a trace matching any keep-policy is stored.
+  tail_sampling:
+    # Must exceed p99 end-to-end trace duration. Set below it and slow traces
+    # are decided before their slowest spans arrive - which silently defeats
+    # the latency policy, since the very traces it targets are the ones most
+    # likely to still be in flight.
+    decision_wait: 10s
+    num_traces: 50000
+    expected_new_traces_per_sec: 100
+    policies:
+      - name: errors-always
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: latency-over-500ms
+        type: latency
+        latency:
+          threshold_ms: 500
+      - name: baseline
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 10
+
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+exporters:
+  otlp/tempo:
+    endpoint: "${env:TEMPO_ENDPOINT}"
+
+service:
+  pipelines:
+    # Traces only. Metrics, logs and span_metrics all terminate in tier 1;
+    # routing them through here would pin unrelated signals to the one tier
+    # that cannot scale down freely.
+    traces/tempo:
+      receivers: [otlp]
+      processors: [memory_limiter, tail_sampling, batch]
+      exporters: [otlp/tempo]

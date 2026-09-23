@@ -1,0 +1,66 @@
+# Local LGTM stack for @crudmates/observe.
+# Gateway collector (this recipe) + Tempo + Mimir + Loki + Grafana.
+# Production Helm, TLS, and credentials are ops — not this package.
+#
+#   docker compose -f deploy/local/docker-compose.yaml up
+#   OBSERVE_ENDPOINT=http://localhost:4318
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    environment:
+      TEMPO_ENDPOINT: tempo:4317
+      MIMIR_REMOTE_WRITE: http://mimir:9009/api/v1/push
+      LOKI_ENDPOINT: http://loki:3100/otlp
+    depends_on:
+      - tempo
+      - mimir
+      - loki
+
+  tempo:
+    image: grafana/tempo:2.8.2
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    expose:
+      - "4317"
+      - "3200"
+
+  mimir:
+    image: grafana/mimir:latest
+    command: ["-config.file=/etc/mimir.yaml", "-target=all"]
+    volumes:
+      - ./mimir.yaml:/etc/mimir.yaml:ro
+    ports:
+      - "9009:9009"
+
+  loki:
+    image: grafana/loki:3.4.2
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    ports:
+      - "3100:3100"
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - tempo
+      - mimir
+      - loki
+
+volumes:
+  tempo_data:

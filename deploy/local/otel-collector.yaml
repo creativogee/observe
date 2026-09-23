@@ -1,0 +1,99 @@
+# Crudmates Observe — gateway collector (not a sidecar).
+# Apps send OTLP here; Tempo, Mimir, and Loki appear only in this process.
+#
+# SINGLE INSTANCE ONLY. `tail_sampling` below buffers a trace until it has
+# every span, so it is correct here - one process receives the whole trace -
+# and silently wrong at 2+ replicas behind a round-robin Service, where each
+# replica sees a fragment and decides on partial information. Production runs
+# the two-tier split in `deploy/self-hosted/` or `deploy/grafana-cloud/`: a
+# stateless gateway that routes by trace ID, and a sampler tier that owns
+# whole traces.
+#
+# Validate:
+#   docker run --rm \
+#     -v "$(pwd)/deploy/local/otel-collector.yaml:/etc/otelcol/config.yaml:ro" \
+#     otel/opentelemetry-collector-contrib:latest \
+#     validate --config=/etc/otelcol/config.yaml
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+  # Budget control lives here, not in every service.
+  # Local compose keeps 100% so a handful of RPCs actually show in Grafana.
+  # Production: decision_wait 10s, probabilistic 10, keep errors and >500ms.
+  tail_sampling:
+    decision_wait: 1s
+    num_traces: 50000
+    expected_new_traces_per_sec: 100
+    policies:
+      - name: errors-always
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: latency-over-500ms
+        type: latency
+        latency:
+          threshold_ms: 500
+      - name: keep-all-local
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 100
+
+connectors:
+  span_metrics:
+    dimensions:
+      - name: http.route
+      - name: http.request.method
+      - name: rpc.system
+      - name: rpc.service
+      - name: rpc.method
+
+exporters:
+  otlp/tempo:
+    endpoint: "${env:TEMPO_ENDPOINT:-tempo:4317}"
+    tls:
+      insecure: true
+  prometheusremotewrite:
+    endpoint: "${env:MIMIR_REMOTE_WRITE:-http://mimir:9009/api/v1/push}"
+    tls:
+      insecure: true
+
+  otlp_http/loki:
+    endpoint: "${env:LOKI_ENDPOINT:-http://loki:3100/otlp}"
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    # Fan-out at the receiver so span_metrics (Mimir RED) sees every span.
+    # This amends the original plan (span_metrics after tail_sampling), which
+    # would have biased RED by the 10% keep rate.
+    traces/metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [span_metrics]
+    traces/tempo:
+      receivers: [otlp]
+      processors: [memory_limiter, tail_sampling, batch]
+      exporters: [otlp/tempo]
+    metrics:
+      receivers: [otlp, span_metrics]
+      processors: [batch]
+      exporters: [prometheusremotewrite]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/loki]
